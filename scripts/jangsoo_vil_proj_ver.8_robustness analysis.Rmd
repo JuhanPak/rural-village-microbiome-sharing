@@ -1,0 +1,903 @@
+---
+title: "jangsoo_vil_proj_ver.8_robustness analysis"
+author: "Juhan Pak"
+date: "2026-06-07"
+output: html_document
+---
+
+```{r}
+# =========================================================
+# Robustness analysis:
+# Within-village ASV sharing under alternative ASV detection thresholds
+#
+# Detection thresholds:
+#   0.01% = 0.0001
+#   0.05% = 0.0005
+#   0.10% = 0.001  [primary]
+#
+# Main outputs:
+#   robustness/within_village_sharing/tables/
+#     - robustness_threshold_summary.csv
+#     - robustness_village_intra_inter_by_threshold.csv
+#     - robustness_nearest_neighbor_table.csv
+#
+#   robustness/within_village_sharing/plots/
+#     - robustness_overall_intra_vs_inter_by_threshold.png/.svg
+#     - robustness_village_delta_by_threshold_boxplot.png/.svg
+#     - robustness_intra_gt_inter_counts_by_threshold.png/.svg
+#     - robustness_delta_correlation_vs_primary.png/.svg
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(readr)
+  library(scales)
+})
+
+# ---------------------------------------------------------
+# 0) Preconditions
+# ---------------------------------------------------------
+stopifnot(exists("merged"))
+stopifnot(exists("vil_tbl"))
+stopifnot(exists("base_theme"))
+stopifnot(exists("save_plot_both"))
+
+if (!exists("asv_abund")) {
+  if (exists("asv_raw")) {
+    sample_cols_tmp <- grep("^S\\d{4}$", names(asv_raw), value = TRUE)
+    stopifnot("ASV" %in% names(asv_raw), length(sample_cols_tmp) > 0)
+    
+    asv_abund <- asv_raw %>%
+      select(ASV, all_of(sample_cols_tmp)) %>%
+      mutate(across(all_of(sample_cols_tmp), as.numeric)) %>%
+      arrange(ASV)
+  } else {
+    stop("Required object 'asv_abund' is missing, and 'asv_raw' is also unavailable.")
+  }
+}
+
+stopifnot("ASV" %in% names(asv_abund))
+stopifnot(all(c("sampleid", "village_name", "vil_id", "cluster") %in% names(merged)))
+stopifnot(all(c("label", "vil_id", "lon", "lat") %in% names(vil_tbl)))
+
+# ---------------------------------------------------------
+# 1) Output folders
+# ---------------------------------------------------------
+OUTDIR_ROBUST <- "robustness/within_village_sharing"
+dir.create(OUTDIR_ROBUST, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUTDIR_ROBUST, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUTDIR_ROBUST, "plots"), recursive = TRUE, showWarnings = FALSE)
+
+# ---------------------------------------------------------
+# 2) Parameters
+# ---------------------------------------------------------
+detection_thresholds <- tibble(
+  threshold_label = c("0.01%", "0.05%", "0.1%"),
+  threshold_value = c(0.0001, 0.0005, 0.001),
+  threshold_order = c(1, 2, 3),
+  primary_threshold = c(FALSE, FALSE, TRUE)
+)
+
+k_neigh <- 3
+
+# ---------------------------------------------------------
+# 3) Sample and village metadata
+# ---------------------------------------------------------
+sample_cols <- setdiff(names(asv_abund), "ASV")
+
+meta_min <- merged %>%
+  transmute(
+    sampleid = as.character(sampleid),
+    village_name = as.character(village_name),
+    vil_id = as.character(vil_id),
+    cluster = as.character(cluster)
+  ) %>%
+  filter(sampleid %in% sample_cols) %>%
+  distinct()
+
+all_samples <- intersect(meta_min$sampleid, sample_cols)
+
+if (length(all_samples) < 3) {
+  stop("Too few shared samples between asv_abund and merged metadata.")
+}
+
+vil_list <- split(meta_min$sampleid, meta_min$vil_id)
+
+vil_info <- meta_min %>%
+  distinct(vil_id, village_name, cluster) %>%
+  left_join(
+    meta_min %>%
+      count(vil_id, name = "n_samples"),
+    by = "vil_id"
+  ) %>%
+  left_join(
+    vil_tbl %>%
+      transmute(
+        vil_id = as.character(vil_id),
+        lon = as.numeric(lon),
+        lat = as.numeric(lat)
+      ),
+    by = "vil_id"
+  ) %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  arrange(cluster, vil_id)
+
+# keep only villages with coordinates and samples
+vil_list <- vil_list[names(vil_list) %in% vil_info$vil_id]
+
+if (length(vil_list) < 3) {
+  stop("Too few villages with both samples and coordinates.")
+}
+
+# ---------------------------------------------------------
+# 4) Haversine distance and k-nearest neighbor table
+# ---------------------------------------------------------
+haversine_km <- function(lat1, lon1, lat2, lon2) {
+  R <- 6371.0088
+  toRad <- pi / 180
+  dlat <- (lat2 - lat1) * toRad
+  dlon <- (lon2 - lon1) * toRad
+  a <- sin(dlat / 2)^2 +
+    cos(lat1 * toRad) * cos(lat2 * toRad) * sin(dlon / 2)^2
+  2 * R * asin(pmin(1, sqrt(a)))
+}
+
+vn <- vil_info$vil_id
+nV <- length(vn)
+
+D_village <- matrix(NA_real_, nV, nV, dimnames = list(vn, vn))
+
+for (i in seq_len(nV)) {
+  for (j in seq_len(nV)) {
+    D_village[i, j] <- if (i == j) {
+      Inf
+    } else {
+      haversine_km(
+        vil_info$lat[i], vil_info$lon[i],
+        vil_info$lat[j], vil_info$lon[j]
+      )
+    }
+  }
+}
+
+nn_tbl <- lapply(vn, function(v) {
+  ord <- order(D_village[v, ], na.last = NA)
+  nb <- colnames(D_village)[ord][1:min(k_neigh, length(ord))]
+  tibble(
+    vil_id = v,
+    neigh_vil_id = nb,
+    dist_km = D_village[v, nb]
+  )
+}) %>%
+  bind_rows() %>%
+  left_join(
+    vil_info %>%
+      select(vil_id, village_name, cluster),
+    by = "vil_id"
+  ) %>%
+  left_join(
+    vil_info %>%
+      select(
+        neigh_vil_id = vil_id,
+        neigh_village_name = village_name,
+        neigh_cluster = cluster
+      ),
+    by = "neigh_vil_id"
+  )
+
+write_csv(
+  nn_tbl,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_nearest_neighbor_table.csv")
+)
+
+# ---------------------------------------------------------
+# 5) Helper functions
+# ---------------------------------------------------------
+mean_upper <- function(mat) {
+  if (nrow(mat) < 2) return(NA_real_)
+  vals <- mat[upper.tri(mat)]
+  vals <- vals[is.finite(vals)]
+  if (length(vals) == 0) return(NA_real_)
+  mean(vals, na.rm = TRUE)
+}
+
+get_intra_vals <- function(Jmat, ids) {
+  ids <- intersect(ids, rownames(Jmat))
+  if (length(ids) < 2) return(numeric(0))
+  x <- Jmat[ids, ids, drop = FALSE]
+  vals <- x[upper.tri(x)]
+  vals <- vals[is.finite(vals)]
+  as.numeric(vals)
+}
+
+get_between_vals <- function(Jmat, idsA, idsB) {
+  idsA <- intersect(idsA, rownames(Jmat))
+  idsB <- intersect(idsB, colnames(Jmat))
+  if (length(idsA) == 0 || length(idsB) == 0) return(numeric(0))
+  x <- Jmat[idsA, idsB, drop = FALSE]
+  vals <- as.vector(x)
+  vals <- vals[is.finite(vals)]
+  as.numeric(vals)
+}
+
+mean_between <- function(Jmat, idsA, idsB) {
+  vals <- get_between_vals(Jmat, idsA, idsB)
+  if (length(vals) == 0) return(NA_real_)
+  mean(vals, na.rm = TRUE)
+}
+
+fmt_p <- function(p) {
+  ifelse(
+    is.na(p),
+    "NA",
+    ifelse(
+      p < 0.001,
+      formatC(p, format = "e", digits = 2),
+      formatC(p, format = "f", digits = 3)
+    )
+  )
+}
+
+calc_jaccard_similarity_from_pa <- function(pa_tbl, samples_use) {
+  M <- pa_tbl %>%
+    select(ASV, all_of(samples_use)) %>%
+    column_to_rownames("ASV") %>%
+    as.matrix()
+  
+  M[is.na(M)] <- 0
+  M <- (M > 0) * 1L
+  
+  # ASV x sample matrix
+  Ixy <- crossprod(M)
+  k <- colSums(M)
+  Uxy <- outer(k, k, "+") - Ixy
+  
+  J <- Ixy / Uxy
+  diag(J) <- NA_real_
+  J[Uxy == 0] <- NA_real_
+  
+  colnames(J) <- rownames(J) <- colnames(M)
+  J
+}
+
+dist_to_pairwise_long <- function(Jmat) {
+  ids <- rownames(Jmat)
+  ut <- which(upper.tri(Jmat), arr.ind = TRUE)
+  
+  tibble(
+    sample1 = ids[ut[, 1]],
+    sample2 = ids[ut[, 2]],
+    jaccard_sim = as.numeric(Jmat[ut])
+  ) %>%
+    filter(is.finite(jaccard_sim))
+}
+
+run_one_threshold <- function(thr_label, thr_value, thr_order, primary_flag) {
+  
+  message("\nRunning threshold: ", thr_label, " [", thr_value, "]")
+  
+  # -------------------------------------------------------
+  # A) Build P/A table
+  # -------------------------------------------------------
+  asv_pa_thr <- asv_abund %>%
+    select(ASV, all_of(all_samples)) %>%
+    mutate(across(all_of(all_samples), ~ as.integer(.x >= thr_value)))
+  
+  asv_detected_any <- asv_pa_thr %>%
+    mutate(any_detected = rowSums(across(all_of(all_samples)), na.rm = TRUE) > 0) %>%
+    summarise(n_asvs_detected_any = sum(any_detected)) %>%
+    pull(n_asvs_detected_any)
+  
+  sample_nonzero_tbl <- asv_pa_thr %>%
+    select(all_of(all_samples)) %>%
+    summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
+    pivot_longer(
+      everything(),
+      names_to = "sampleid",
+      values_to = "n_detected_asvs"
+    ) %>%
+    mutate(nonzero_sample = n_detected_asvs > 0)
+  
+  n_nonzero_samples <- sum(sample_nonzero_tbl$nonzero_sample, na.rm = TRUE)
+  
+  # -------------------------------------------------------
+  # B) Jaccard similarity
+  # -------------------------------------------------------
+  J <- calc_jaccard_similarity_from_pa(asv_pa_thr, all_samples)
+  
+  # -------------------------------------------------------
+  # C) Pairwise overall same-village vs different-village
+  # -------------------------------------------------------
+  pw_thr <- dist_to_pairwise_long(J) %>%
+    left_join(
+      meta_min,
+      by = c("sample1" = "sampleid")
+    ) %>%
+    rename(
+      vil_id1 = vil_id,
+      village_name1 = village_name,
+      cluster1 = cluster
+    ) %>%
+    left_join(
+      meta_min,
+      by = c("sample2" = "sampleid")
+    ) %>%
+    rename(
+      vil_id2 = vil_id,
+      village_name2 = village_name,
+      cluster2 = cluster
+    ) %>%
+    mutate(
+      same_village = vil_id1 == vil_id2,
+      same_cluster = cluster1 == cluster2,
+      threshold_label = thr_label,
+      threshold_value = thr_value,
+      threshold_order = thr_order,
+      primary_threshold = primary_flag
+    )
+  
+  overall_pair_summary <- pw_thr %>%
+    group_by(threshold_label, threshold_value, threshold_order, primary_threshold, same_village) %>%
+    summarise(
+      mean_jaccard = mean(jaccard_sim, na.rm = TRUE),
+      median_jaccard = median(jaccard_sim, na.rm = TRUE),
+      sd_jaccard = sd(jaccard_sim, na.rm = TRUE),
+      n_pairs = n(),
+      .groups = "drop"
+    )
+  
+  overall_wilcox <- tryCatch(
+    {
+      wilcox.test(jaccard_sim ~ same_village, data = pw_thr)
+    },
+    error = function(e) NULL
+  )
+  
+  overall_p <- if (is.null(overall_wilcox)) NA_real_ else overall_wilcox$p.value
+  
+  # -------------------------------------------------------
+  # D) Village-wise intra and nearest-neighbor inter
+  # -------------------------------------------------------
+  intra_df <- tibble(vil_id = names(vil_list)) %>%
+    rowwise() %>%
+    mutate(
+      intra = {
+        ids <- vil_list[[vil_id]]
+        mean_upper(J[ids, ids, drop = FALSE])
+      }
+    ) %>%
+    ungroup()
+  
+  inter_k_df <- nn_tbl %>%
+    rowwise() %>%
+    mutate(
+      inter_pair = {
+        a <- vil_id
+        b <- neigh_vil_id
+        mean_between(J, vil_list[[a]], vil_list[[b]])
+      }
+    ) %>%
+    ungroup() %>%
+    group_by(vil_id) %>%
+    summarise(
+      inter_k3 = mean(inter_pair, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  neigh_list <- split(nn_tbl$neigh_vil_id, nn_tbl$vil_id)
+  
+  vil_sig_thr <- tibble(vil_id = names(vil_list)) %>%
+    rowwise() %>%
+    mutate(
+      intra_vals = list(get_intra_vals(J, vil_list[[vil_id]])),
+      inter_vals = list({
+        nbs <- neigh_list[[vil_id]]
+        if (is.null(nbs) || length(nbs) == 0) {
+          numeric(0)
+        } else {
+          unlist(
+            lapply(nbs, function(nb) {
+              get_between_vals(J, vil_list[[vil_id]], vil_list[[nb]])
+            }),
+            use.names = FALSE
+          )
+        }
+      }),
+      n_intra_pairs = length(intra_vals),
+      n_inter_pairs = length(inter_vals),
+      median_intra_pair = if (n_intra_pairs > 0) median(intra_vals) else NA_real_,
+      median_inter_pair = if (n_inter_pairs > 0) median(inter_vals) else NA_real_,
+      p_value = if (n_intra_pairs > 1 && n_inter_pairs > 1) {
+        suppressWarnings(
+          wilcox.test(
+            unlist(intra_vals),
+            unlist(inter_vals),
+            alternative = "greater"
+          )$p.value
+        )
+      } else {
+        NA_real_
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(
+      p_adj = p.adjust(p_value, method = "BH"),
+      sig_vil = !is.na(p_adj) & p_adj < 0.05
+    ) %>%
+    select(
+      vil_id,
+      n_intra_pairs,
+      n_inter_pairs,
+      median_intra_pair,
+      median_inter_pair,
+      p_value,
+      p_adj,
+      sig_vil
+    )
+  
+  vil_cmp_thr <- intra_df %>%
+    left_join(inter_k_df, by = "vil_id") %>%
+    left_join(vil_info, by = "vil_id") %>%
+    left_join(vil_sig_thr, by = "vil_id") %>%
+    mutate(
+      intra_pct = 100 * intra,
+      inter_k3_pct = 100 * inter_k3,
+      delta_pct = intra_pct - inter_k3_pct,
+      intra_gt_inter = !is.na(delta_pct) & delta_pct > 0,
+      threshold_label = thr_label,
+      threshold_value = thr_value,
+      threshold_order = thr_order,
+      primary_threshold = primary_flag
+    ) %>%
+    select(
+      threshold_label,
+      threshold_value,
+      threshold_order,
+      primary_threshold,
+      vil_id,
+      village_name,
+      cluster,
+      n_samples,
+      lon,
+      lat,
+      intra,
+      inter_k3,
+      intra_pct,
+      inter_k3_pct,
+      delta_pct,
+      intra_gt_inter,
+      n_intra_pairs,
+      n_inter_pairs,
+      median_intra_pair,
+      median_inter_pair,
+      p_value,
+      p_adj,
+      sig_vil
+    )
+  
+  threshold_summary <- vil_cmp_thr %>%
+    summarise(
+      threshold_label = thr_label,
+      threshold_value = thr_value,
+      threshold_order = thr_order,
+      primary_threshold = primary_flag,
+      n_asvs_detected_any = asv_detected_any,
+      n_nonzero_samples = n_nonzero_samples,
+      n_villages = n(),
+      n_intra_gt_inter = sum(intra_gt_inter, na.rm = TRUE),
+      pct_intra_gt_inter = 100 * mean(intra_gt_inter, na.rm = TRUE),
+      n_sig_intra_gt_inter = sum(sig_vil & intra_gt_inter, na.rm = TRUE),
+      mean_intra_pct = mean(intra_pct, na.rm = TRUE),
+      mean_inter_k3_pct = mean(inter_k3_pct, na.rm = TRUE),
+      mean_delta_pct = mean(delta_pct, na.rm = TRUE),
+      median_delta_pct = median(delta_pct, na.rm = TRUE),
+      overall_pairwise_wilcox_p = overall_p,
+      .groups = "drop"
+    )
+  
+  list(
+    pw_thr = pw_thr,
+    overall_pair_summary = overall_pair_summary,
+    vil_cmp_thr = vil_cmp_thr,
+    threshold_summary = threshold_summary
+  )
+}
+
+# ---------------------------------------------------------
+# 6) Run all thresholds
+# ---------------------------------------------------------
+robust_results <- lapply(seq_len(nrow(detection_thresholds)), function(i) {
+  run_one_threshold(
+    thr_label = detection_thresholds$threshold_label[i],
+    thr_value = detection_thresholds$threshold_value[i],
+    thr_order = detection_thresholds$threshold_order[i],
+    primary_flag = detection_thresholds$primary_threshold[i]
+  )
+})
+
+# ---------------------------------------------------------
+# 7) Combine result tables
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 7) Combine result tables
+# ---------------------------------------------------------
+robust_pair_summary <- bind_rows(
+  lapply(robust_results, function(x) x[["overall_pair_summary"]])
+)
+
+robust_village_tbl <- bind_rows(
+  lapply(robust_results, function(x) x[["vil_cmp_thr"]])
+)
+
+robust_threshold_summary <- bind_rows(
+  lapply(robust_results, function(x) x[["threshold_summary"]])
+)
+
+# Pairwise table can be very large. Save only if needed.
+SAVE_PAIRWISE_LONG <- FALSE
+
+if (SAVE_PAIRWISE_LONG) {
+  robust_pw_tbl <- bind_rows(
+    lapply(robust_results, function(x) x[["pw_thr"]])
+  )
+  
+  write_csv(
+    robust_pw_tbl,
+    file.path(OUTDIR_ROBUST, "tables", "robustness_pairwise_jaccard_long_by_threshold.csv")
+  )
+}
+
+
+robust_pair_summary <- robust_pair_summary %>%
+  mutate(
+    threshold_label = factor(
+      threshold_label,
+      levels = detection_thresholds$threshold_label
+    ),
+    same_village_label = ifelse(same_village, "Within village", "Between villages")
+  )
+
+robust_village_tbl <- robust_village_tbl %>%
+  mutate(
+    threshold_label = factor(
+      threshold_label,
+      levels = detection_thresholds$threshold_label
+    ),
+    cluster = factor(as.character(cluster), levels = if (exists("clu_pal")) names(clu_pal) else sort(unique(as.character(cluster))))
+  )
+
+robust_threshold_summary <- robust_threshold_summary %>%
+  mutate(
+    threshold_label = factor(
+      threshold_label,
+      levels = detection_thresholds$threshold_label
+    )
+  ) %>%
+  arrange(threshold_order)
+
+# ---------------------------------------------------------
+# 8) Correlation of village-level delta with primary threshold
+# ---------------------------------------------------------
+primary_label <- detection_thresholds %>%
+  filter(primary_threshold) %>%
+  pull(threshold_label)
+
+primary_delta_tbl <- robust_village_tbl %>%
+  filter(as.character(threshold_label) == primary_label) %>%
+  select(
+    vil_id,
+    primary_delta_pct = delta_pct,
+    primary_intra_gt_inter = intra_gt_inter,
+    primary_sig_vil = sig_vil
+  )
+
+robust_delta_correlation_tbl <- robust_village_tbl %>%
+  left_join(primary_delta_tbl, by = "vil_id") %>%
+  filter(as.character(threshold_label) != primary_label) %>%
+  group_by(threshold_label, threshold_value, threshold_order) %>%
+  summarise(
+    n_villages = sum(!is.na(delta_pct) & !is.na(primary_delta_pct)),
+    spearman_rho = suppressWarnings(
+      cor(delta_pct, primary_delta_pct, method = "spearman", use = "complete.obs")
+    ),
+    pearson_r = suppressWarnings(
+      cor(delta_pct, primary_delta_pct, method = "pearson", use = "complete.obs")
+    ),
+    .groups = "drop"
+  )
+
+# ---------------------------------------------------------
+# 9) Export tables
+# ---------------------------------------------------------
+write_csv(
+  robust_threshold_summary,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_threshold_summary.csv")
+)
+
+write_csv(
+  robust_pair_summary,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_pairwise_summary_by_threshold.csv")
+)
+
+write_csv(
+  robust_village_tbl,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_village_intra_inter_by_threshold.csv")
+)
+
+write_csv(
+  robust_delta_correlation_tbl,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_delta_correlation_vs_primary.csv")
+)
+
+cat("\n===== Robustness threshold summary =====\n")
+print(robust_threshold_summary)
+
+cat("\n===== Delta correlation vs primary threshold =====\n")
+print(robust_delta_correlation_tbl)
+
+# ---------------------------------------------------------
+# 10) Plot 1: overall within vs between by threshold
+# ---------------------------------------------------------
+p_overall_robust <- ggplot(
+  robust_pair_summary,
+  aes(x = threshold_label, y = 100 * mean_jaccard, group = same_village_label)
+) +
+  geom_line(aes(linetype = same_village_label), linewidth = 0.7, color = "black") +
+  geom_point(aes(shape = same_village_label), size = 3, color = "black") +
+  geom_errorbar(
+    aes(
+      ymin = 100 * (mean_jaccard - sd_jaccard / sqrt(n_pairs)),
+      ymax = 100 * (mean_jaccard + sd_jaccard / sqrt(n_pairs))
+    ),
+    width = 0.08,
+    linewidth = 0.4,
+    color = "grey40"
+  ) +
+  scale_shape_manual(
+    values = c("Within village" = 16, "Between villages" = 17),
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = c("Within village" = "solid", "Between villages" = "dashed"),
+    name = NULL
+  ) +
+  labs(
+    title = "Robustness of within-village ASV sharing across detection thresholds",
+    subtitle = "Mean pairwise Jaccard similarity calculated from ASV presence/absence matrices",
+    x = "ASV detection threshold",
+    y = "Mean ASV sharing rate (%)"
+  ) +
+  base_theme +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_overall_robust)
+
+save_plot_both(
+  p_overall_robust,
+  file.path(OUTDIR_ROBUST, "plots", "robustness_overall_intra_vs_inter_by_threshold"),
+  width = 8,
+  height = 6
+)
+
+# ---------------------------------------------------------
+# 11) Plot 2: village-level delta by threshold
+# ---------------------------------------------------------
+p_delta_box <- ggplot(
+  robust_village_tbl,
+  aes(x = threshold_label, y = delta_pct)
+) +
+  geom_hline(yintercept = 0, linewidth = 0.45, linetype = "dashed", color = "grey35") +
+  geom_boxplot(width = 0.55, outlier.shape = NA, fill = "grey90", color = "black") +
+  geom_jitter(
+    aes(color = cluster),
+    width = 0.12,
+    height = 0,
+    size = 2.1,
+    alpha = 0.75
+  ) +
+  {
+    if (exists("clu_pal")) {
+      scale_color_manual(values = clu_pal, drop = FALSE, name = "Cluster")
+    } else {
+      scale_color_discrete(name = "Cluster")
+    }
+  } +
+  labs(
+    title = "Village-level excess ASV sharing across detection thresholds",
+    subtitle = expression(Delta~"sharing = within-village sharing - nearest-neighbor inter-village sharing"),
+    x = "ASV detection threshold",
+    y = expression(Delta~"sharing (%)")
+  ) +
+  base_theme +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_delta_box)
+
+save_plot_both(
+  p_delta_box,
+  file.path(OUTDIR_ROBUST, "plots", "robustness_village_delta_by_threshold_boxplot"),
+  width = 8,
+  height = 6
+)
+
+# ---------------------------------------------------------
+# 12) Plot 3: counts of intra > inter and significant villages
+# ---------------------------------------------------------
+robust_counts_long <- robust_threshold_summary %>%
+  select(
+    threshold_label,
+    n_villages,
+    n_intra_gt_inter,
+    n_sig_intra_gt_inter
+  ) %>%
+  pivot_longer(
+    cols = c(n_intra_gt_inter, n_sig_intra_gt_inter),
+    names_to = "metric",
+    values_to = "n"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      n_intra_gt_inter = "Intra > inter",
+      n_sig_intra_gt_inter = "Significant intra > inter"
+    ),
+    metric = factor(metric, levels = c("Intra > inter", "Significant intra > inter"))
+  )
+
+p_counts <- ggplot(
+  robust_counts_long,
+  aes(x = threshold_label, y = n, fill = metric)
+) +
+  geom_col(
+    position = position_dodge(width = 0.65),
+    width = 0.55,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 0.65),
+    vjust = -0.35,
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Intra > inter" = "#D55E00",
+      "Significant intra > inter" = "black"
+    ),
+    name = NULL
+  ) +
+  labs(
+    title = "Number of villages with excess within-village sharing",
+    subtitle = "Significant villages are based on one-sided Wilcoxon tests with Benjamini-Hochberg correction",
+    x = "ASV detection threshold",
+    y = "Number of villages"
+  ) +
+  base_theme +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_counts)
+
+save_plot_both(
+  p_counts,
+  file.path(OUTDIR_ROBUST, "plots", "robustness_intra_gt_inter_counts_by_threshold"),
+  width = 8,
+  height = 6
+)
+
+# ---------------------------------------------------------
+# 13) Plot 4: village-level delta correlation vs primary threshold
+# ---------------------------------------------------------
+delta_scatter_tbl <- robust_village_tbl %>%
+  left_join(primary_delta_tbl, by = "vil_id") %>%
+  filter(as.character(threshold_label) != primary_label) %>%
+  mutate(
+    threshold_label = factor(
+      threshold_label,
+      levels = detection_thresholds$threshold_label[detection_thresholds$threshold_label != primary_label]
+    )
+  )
+
+corr_label_tbl <- robust_delta_correlation_tbl %>%
+  mutate(
+    label = paste0(
+      "Spearman rho = ",
+      formatC(spearman_rho, format = "f", digits = 2)
+    )
+  )
+
+p_delta_corr <- ggplot(
+  delta_scatter_tbl,
+  aes(x = primary_delta_pct, y = delta_pct)
+) +
+  geom_hline(yintercept = 0, linewidth = 0.35, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linewidth = 0.35, linetype = "dashed", color = "grey50") +
+  geom_point(
+    aes(color = cluster),
+    size = 2.2,
+    alpha = 0.8
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.7,
+    color = "black"
+  ) +
+  geom_text(
+    data = corr_label_tbl,
+    aes(x = -Inf, y = Inf, label = label),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 4
+  ) +
+  facet_wrap(~ threshold_label, nrow = 1) +
+  {
+    if (exists("clu_pal")) {
+      scale_color_manual(values = clu_pal, drop = FALSE, name = "Cluster")
+    } else {
+      scale_color_discrete(name = "Cluster")
+    }
+  } +
+  labs(
+    title = "Village-level Δ sharing is stable relative to the primary threshold",
+    subtitle = paste0("Primary threshold: ", primary_label),
+    x = paste0("Δ sharing at primary threshold ", primary_label, " (%)"),
+    y = "Δ sharing at alternative threshold (%)"
+  ) +
+  base_theme +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_delta_corr)
+
+save_plot_both(
+  p_delta_corr,
+  file.path(OUTDIR_ROBUST, "plots", "robustness_delta_correlation_vs_primary"),
+  width = 10,
+  height = 5.5
+)
+
+# ---------------------------------------------------------
+# 14) Compact manuscript-facing summary table
+# ---------------------------------------------------------
+robust_manuscript_summary <- robust_threshold_summary %>%
+  transmute(
+    Detection_threshold = as.character(threshold_label),
+    N_ASVs_detected_at_least_once = n_asvs_detected_any,
+    N_nonzero_samples = n_nonzero_samples,
+    N_villages = n_villages,
+    N_villages_intra_gt_inter = n_intra_gt_inter,
+    Percent_villages_intra_gt_inter = pct_intra_gt_inter,
+    N_significant_villages_intra_gt_inter = n_sig_intra_gt_inter,
+    Mean_within_village_sharing_pct = mean_intra_pct,
+    Mean_nearest_neighbor_inter_village_sharing_pct = mean_inter_k3_pct,
+    Mean_delta_sharing_pct = mean_delta_pct,
+    Median_delta_sharing_pct = median_delta_pct,
+    Overall_pairwise_Wilcoxon_P = overall_pairwise_wilcox_p
+  )
+
+write_csv(
+  robust_manuscript_summary,
+  file.path(OUTDIR_ROBUST, "tables", "robustness_manuscript_summary.csv")
+)
+
+cat("\n===== Manuscript-facing robustness summary =====\n")
+print(robust_manuscript_summary)
+```
+

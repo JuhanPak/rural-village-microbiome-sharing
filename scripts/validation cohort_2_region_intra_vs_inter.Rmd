@@ -1,0 +1,588 @@
+---
+title: "Untitled"
+author: "Juhan Pak"
+date: "2026-06-28"
+output: html_document
+---
+
+---
+title: "Region-level intra vs inter ASV sharing"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# =====================================================================
+# Cluster(region)-level intra vs inter ASV sharing (Jaccard similarity).
+#
+# R Markdown version
+# - Original style retained
+# - Reads exported QIIME2 feature-table.tsv directly
+# - No qiime2R required
+# - No biom command required
+# - Saves both PDF and SVG
+#
+# EXPLORATORY / comparison only -- NOT a paper-ready result.
+#   - intra(r) = within-region sample-pair Jaccard sharing
+#   - inter(r) = region r vs other regions sample-pair sharing
+#   - Wilcoxon BH + label-permutation p
+#
+# CAVEATS:
+#   (1) 3 distant cities differ for many reasons
+#       diet/batch/recruitment -> intra>inter is near-automatic & confounded
+#   (2) no village sub-unit -> sample-pairwise pseudoreplication inflates n
+# =====================================================================
+
+required_pkgs <- c("vegan", "svglite")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressMessages(library(vegan))
+```
+
+# 1. User parameters
+
+```{r parameters}
+## ------------------------- USER PARAMETERS ---------------------------
+asv_table_path <- "inputs/exported_clustering_table/feature-table.tsv"
+metadata_path  <- "inputs/clustering_meta.txt"
+
+sample_id_col  <- NA
+region_col     <- "category"
+
+table_features_as_rows <- TRUE
+
+do_rarefy      <- TRUE
+min_depth      <- NA
+
+detect_thr     <- 0.001       # 0.1% relative abundance
+max_per_region <- 300         # subsample cap per region
+n_perm         <- 200         # label permutations
+
+seed           <- 1
+out_dir        <- "results"
+## --------------------------------------------------------------------
+
+set.seed(seed)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 2. Helper functions
+
+```{r helper-functions}
+read_tsv_table <- function(path, far = TRUE) {
+  if (!file.exists(path)) {
+    stop("Feature table not found: ", path)
+  }
+
+  first <- readLines(path, n = 1)
+
+  skip <- if (grepl("^# Constructed", first)) {
+    1L
+  } else {
+    0L
+  }
+
+  df <- read.table(
+    path,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    skip = skip,
+    row.names = 1,
+    stringsAsFactors = FALSE
+  )
+
+  m <- as.matrix(df)
+  storage.mode(m) <- "numeric"
+
+  if (!far) {
+    m <- t(m)
+  }
+
+  m
+}
+
+read_metadata <- function(path) {
+  if (!file.exists(path)) {
+    stop("Metadata file not found: ", path)
+  }
+
+  lines <- readLines(path)
+
+  lines <- lines[!grepl("^#q2:types", lines)]
+
+  con <- textConnection(lines)
+  on.exit(close(con))
+
+  read.table(
+    con,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+pair_vals <- function(M, inR, outR, which) {
+  if (which == "intra") {
+    sub <- M[inR, inR, drop = FALSE]
+    sub[upper.tri(sub)]
+  } else {
+    c(M[inR, outR])
+  }
+}
+
+stars <- function(p) {
+  ifelse(
+    p < 1e-4, "****",
+    ifelse(
+      p < 1e-3, "***",
+      ifelse(
+        p < 1e-2, "**",
+        ifelse(p < 0.05, "*", "ns")
+      )
+    )
+  )
+}
+
+violin_at <- function(v, xc, width, col) {
+  v <- v[is.finite(v)]
+
+  if (length(v) < 5) {
+    return(invisible())
+  }
+
+  d <- density(v)
+  w <- d$y / max(d$y) * width
+
+  polygon(
+    c(xc - w, rev(xc + w)),
+    c(d$x, rev(d$x)),
+    col = col,
+    border = "grey30",
+    lwd = 0.7
+  )
+
+  qs <- quantile(v, c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+  rect(
+    xc - 0.02,
+    qs[1],
+    xc + 0.02,
+    qs[3],
+    col = "white",
+    border = "grey30",
+    lwd = 0.7
+  )
+
+  segments(
+    xc - 0.035,
+    qs[2],
+    xc + 0.035,
+    qs[2],
+    lwd = 1.3
+  )
+}
+```
+
+# 3. Load table and metadata
+
+```{r load-data}
+feat <- read_tsv_table(
+  asv_table_path,
+  far = table_features_as_rows
+)
+
+meta <- read_metadata(metadata_path)
+
+dim(feat)
+head(meta)
+```
+
+# 4. Match sample IDs
+
+```{r match-samples}
+if (is.na(sample_id_col)) {
+  cand <- c(
+    "sample_id",
+    "sample-id",
+    "sampleid",
+    "SampleID",
+    "#SampleID",
+    "id",
+    "ID",
+    "#OTU ID",
+    "featureid"
+  )
+
+  hit <- cand[cand %in% colnames(meta)]
+
+  if (!length(hit)) {
+    stop(paste(
+      "set sample_id_col. cols:",
+      paste(colnames(meta), collapse = ", ")
+    ))
+  }
+
+  sample_id_col <- hit[1]
+
+  message("Using sample-id column: ", sample_id_col)
+}
+
+if (!(region_col %in% colnames(meta))) {
+  stop(paste(
+    "region_col not found. cols:",
+    paste(colnames(meta), collapse = ", ")
+  ))
+}
+
+meta <- data.frame(
+  sample_id = trimws(as.character(meta[[sample_id_col]])),
+  region = trimws(as.character(meta[[region_col]])),
+  stringsAsFactors = FALSE
+)
+
+colnames(feat) <- trimws(colnames(feat))
+
+common <- intersect(colnames(feat), meta$sample_id)
+
+if (!length(common)) {
+  stop("no overlapping sample ids")
+}
+
+cat(sprintf(
+  "Samples table=%d metadata=%d overlap=%d\n",
+  ncol(feat),
+  nrow(meta),
+  length(common)
+))
+
+feat <- feat[, common, drop = FALSE]
+meta <- meta[match(common, meta$sample_id), ]
+
+counts <- t(feat)
+counts <- counts[rowSums(counts) > 0, , drop = FALSE]
+
+meta <- meta[match(rownames(counts), meta$sample_id), ]
+
+dim(counts)
+head(meta)
+```
+
+# 5. Subsample per region
+
+```{r subsample-per-region}
+## ---- subsample per region (feasibility + lighter pseudoreplication) ----
+
+set.seed(seed)
+
+keep <- unlist(
+  lapply(split(seq_len(nrow(counts)), meta$region), function(ix) {
+    if (length(ix) > max_per_region) {
+      sample(ix, max_per_region)
+    } else {
+      ix
+    }
+  })
+)
+
+counts <- counts[keep, , drop = FALSE]
+meta <- meta[keep, ]
+
+reg <- factor(meta$region)
+
+cat("Samples per region (after cap):\n")
+print(table(reg))
+```
+
+# 6. Rarefaction and Jaccard similarity
+
+```{r rarefy-jaccard}
+## ---- rarefy + presence + Jaccard SIMILARITY matrix ----
+
+if (do_rarefy) {
+  depth <- rowSums(counts)
+
+  target <- if (is.na(min_depth)) {
+    min(depth)
+  } else {
+    as.integer(min_depth)
+  }
+
+  low <- depth < target
+
+  if (any(low)) {
+    counts <- counts[!low, , drop = FALSE]
+    reg <- droplevels(reg[!low])
+  }
+
+  counts <- rrarefy(counts, sample = target)
+
+  cat(sprintf("rarefied to %d\n", target))
+}
+
+relab <- sweep(counts, 1, rowSums(counts), "/")
+
+pa <- (relab >= detect_thr) * 1L
+pa <- pa[, colSums(pa) > 0, drop = FALSE]
+
+M <- 1 - as.matrix(
+  vegdist(pa, method = "jaccard", binary = TRUE)
+)
+
+N <- nrow(M)
+regv <- as.integer(reg)
+levs <- levels(reg)
+
+cat("Final samples per region:\n")
+print(table(reg))
+
+dim(M)
+```
+
+# 7. Per-region intra/inter tests
+
+```{r intra-inter-tests}
+## ---- per-region intra/inter + tests ----
+
+res <- data.frame()
+vio <- list()
+
+for (k in seq_along(levs)) {
+  inR <- which(regv == k)
+  outR <- which(regv != k)
+
+  intra <- pair_vals(M, inR, outR, "intra")
+  inter <- pair_vals(M, inR, outR, "inter")
+
+  w <- suppressWarnings(
+    wilcox.test(
+      intra,
+      inter,
+      alternative = "greater"
+    )
+  )
+
+  res <- rbind(
+    res,
+    data.frame(
+      region = levs[k],
+      n_in = length(inR),
+      n_intra = length(intra),
+      n_inter = length(inter),
+      med_intra = median(intra),
+      med_inter = median(inter),
+      excess = median(intra) - median(inter),
+      wilcox_p = w$p.value
+    )
+  )
+
+  vio[[levs[k]]] <- list(
+    intra = intra,
+    inter = inter
+  )
+}
+
+res$wilcox_padj <- p.adjust(res$wilcox_p, "BH")
+
+res
+```
+
+# 8. Label-permutation P-values
+
+```{r label-permutation}
+## ---- label-permutation p ----
+
+obs_diff <- sapply(seq_along(levs), function(k) {
+  inR <- which(regv == k)
+  outR <- which(regv != k)
+
+  mean(pair_vals(M, inR, outR, "intra")) -
+    mean(pair_vals(M, inR, outR, "inter"))
+})
+
+null_diff <- matrix(NA, n_perm, length(levs))
+
+set.seed(seed)
+
+for (p in seq_len(n_perm)) {
+  pr <- sample(regv)
+
+  null_diff[p, ] <- sapply(seq_along(levs), function(k) {
+    inR <- which(pr == k)
+    outR <- which(pr != k)
+
+    if (length(inR) < 3) {
+      return(NA)
+    }
+
+    mean(pair_vals(M, inR, outR, "intra")) -
+      mean(pair_vals(M, inR, outR, "inter"))
+  })
+}
+
+res$perm_p <- sapply(seq_along(levs), function(k) {
+  (1 + sum(null_diff[, k] >= obs_diff[k], na.rm = TRUE)) /
+    (sum(!is.na(null_diff[, k])) + 1)
+})
+
+write.csv(
+  res,
+  file.path(out_dir, "region_sharing_stats.csv"),
+  row.names = FALSE
+)
+
+res
+```
+
+# 9. Region-level intra vs inter violin plot
+
+```{r region-sharing-violin, fig.width=7, fig.height=5}
+## ---- base-R dodged violin plot ----
+
+R <- length(levs)
+
+ymax <- max(
+  sapply(vio, function(z) {
+    max(c(z$intra, z$inter), na.rm = TRUE)
+  })
+)
+
+draw_region_sharing_violin <- function() {
+  par(mar = c(4, 4, 4, 1))
+
+  plot(
+    NA,
+    xlim = c(0.5, R + 0.5),
+    ylim = c(0, ymax * 1.18),
+    xaxt = "n",
+    xlab = "Region",
+    ylab = "ASV sharing rate (Jaccard)",
+    main = "Region-level: intra vs inter sharing"
+  )
+
+  mtext(
+    "EXPLORATORY - confounded by city differences; n inflated by sample-pair pseudoreplication",
+    side = 3,
+    line = 0.2,
+    cex = 0.65,
+    col = "grey40"
+  )
+
+  axis(
+    1,
+    at = seq_len(R),
+    labels = levs
+  )
+
+  for (k in seq_len(R)) {
+    violin_at(
+      vio[[k]]$inter,
+      k - 0.2,
+      0.17,
+      "grey85"
+    )
+
+    violin_at(
+      vio[[k]]$intra,
+      k + 0.2,
+      0.17,
+      "#f4a6a6"
+    )
+
+    yb <- ymax * 1.05
+
+    segments(
+      k - 0.2,
+      yb,
+      k + 0.2,
+      yb,
+      lwd = 0.8
+    )
+
+    text(
+      k,
+      yb + ymax * 0.03,
+      sprintf(
+        "%s | perm p=%.3g",
+        stars(res$wilcox_padj[k]),
+        res$perm_p[k]
+      ),
+      cex = 0.7
+    )
+  }
+
+  legend(
+    "topleft",
+    legend = c("inter", "intra"),
+    fill = c("grey85", "#f4a6a6"),
+    bty = "n",
+    cex = 0.8
+  )
+}
+
+# PDF 저장
+pdf(
+  file.path(out_dir, "region_sharing_violin.pdf"),
+  width = 2 + 1.4 * R,
+  height = 5
+)
+draw_region_sharing_violin()
+dev.off()
+
+# SVG 저장
+svglite::svglite(
+  file.path(out_dir, "region_sharing_violin.svg"),
+  width = 2 + 1.4 * R,
+  height = 5
+)
+draw_region_sharing_violin()
+dev.off()
+
+# R Markdown 화면 출력
+draw_region_sharing_violin()
+```
+
+# 10. Final report
+
+```{r final-report}
+## ---- report ----
+
+cat("\n===== REGION-LEVEL intra vs inter SHARING =====\n")
+
+print(
+  res[, c(
+    "region",
+    "n_in",
+    "med_intra",
+    "med_inter",
+    "excess",
+    "wilcox_padj",
+    "perm_p"
+  )],
+  row.names = FALSE
+)
+
+cat("\nReading guide:\n")
+cat(" - Wilcoxon **** is expected here from sample-pair pseudoreplication; not strong evidence.\n")
+cat(" - perm p tests only whether regions are distinct populations at all (cities differ),\n")
+cat("   NOT contact-driven sharing. A small perm p just confirms the 3 cities are different.\n")
+cat(" - The aggregation-correct sharing analog remains the gu-level null (urban_sharing.R).\n")
+
+cat("\nWritten:\n")
+cat(" - results/region_sharing_violin.pdf\n")
+cat(" - results/region_sharing_violin.svg\n")
+cat(" - results/region_sharing_stats.csv\n")
+```

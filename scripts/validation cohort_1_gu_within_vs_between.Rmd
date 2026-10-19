@@ -1,0 +1,831 @@
+---
+title: "Untitled"
+author: "Juhan Pak"
+date: "2026-06-28"
+output: html_document
+---
+
+---
+title: "Urban within-gu vs between-gu ASV sharing"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# =========================================================
+# Urban within-unit vs between-unit microbiome sharing
+# NEGATIVE CONTROL
+#
+# R Markdown version for RStudio
+# - Reads exported QIIME2 feature-table.tsv directly
+# - No qiime2R required
+# - No biom command required
+# =========================================================
+
+# ---------------------------------------------------------
+# Package check
+# ---------------------------------------------------------
+required_pkgs <- c("vegan", "ggplot2")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(vegan)
+  library(ggplot2)
+})
+
+set.seed(1)
+```
+
+# 1. User parameters
+
+```{r parameters}
+# ---------------------------------------------------------
+# IMPORTANT
+# ---------------------------------------------------------
+# This script uses the GU-level negative-control dataset.
+# Therefore, use:
+#   sharing feature table
+#   sharing metadata
+#
+# If your actual folder is "inputs" instead of "input",
+# change "input/" to "inputs/" below.
+# ---------------------------------------------------------
+
+asv_table_path <- "inputs/exported_sharing_table/feature-table.tsv"
+metadata_path  <- "inputs/sharing_meta.txt"
+
+# Metadata column settings
+sample_id_col <- NA        # NA = auto-detect
+unit_col      <- "Region"  # gu code column, e.g. A..L
+
+# Data-processing parameters
+table_features_as_rows <- TRUE
+min_unit_n  <- 5
+do_rarefy   <- TRUE
+min_depth   <- NA
+
+# Presence/absence thresholds
+thresholds  <- c(0.001, 0.0005, 0.0001)
+primary_thr <- 0.001
+
+# Statistics
+n_perm <- 999
+seed   <- 1
+
+# Output directory
+out_dir <- "results"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Figure settings
+fig_width  <- 4.2
+fig_height <- 4.6
+fig_dpi    <- 600
+
+within_col  <- "#4E79A7"
+between_col <- "#BDBDBD"
+
+set.seed(seed)
+```
+
+# 2. Helper functions
+
+```{r helper-functions}
+read_tsv_table <- function(path, features_as_rows = TRUE) {
+  if (!file.exists(path)) {
+    stop("Feature table not found: ", path)
+  }
+
+  first <- readLines(path, n = 1)
+
+  # QIIME2/BIOM exported TSV usually starts with:
+  # # Constructed from biom file
+  skip <- if (grepl("^# Constructed", first)) 1L else 0L
+
+  df <- read.table(
+    path,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    skip = skip,
+    row.names = 1,
+    stringsAsFactors = FALSE
+  )
+
+  m <- as.matrix(df)
+  storage.mode(m) <- "numeric"
+
+  if (!features_as_rows) {
+    m <- t(m)
+  }
+
+  return(m)
+}
+
+read_metadata <- function(path) {
+  if (!file.exists(path)) {
+    stop("Metadata file not found: ", path)
+  }
+
+  lines <- readLines(path)
+
+  # Remove QIIME2 metadata type row if present
+  lines <- lines[!grepl("^#q2:types", lines)]
+
+  con <- textConnection(lines)
+  on.exit(close(con))
+
+  read.table(
+    con,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+cliffs_delta <- function(a, b) {
+  gt <- 0
+  lt <- 0
+
+  for (x in a) {
+    gt <- gt + sum(x > b)
+    lt <- lt + sum(x < b)
+  }
+
+  (gt - lt) / (length(a) * length(b))
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+nature_theme <- function(base_size = 10, base_family = "sans") {
+  theme_classic(base_size = base_size, base_family = base_family) +
+    theme(
+      text = element_text(color = "black"),
+      plot.title = element_text(
+        size = 12,
+        face = "bold",
+        hjust = 0,
+        margin = margin(b = 4)
+      ),
+      plot.subtitle = element_text(
+        size = 9.5,
+        hjust = 0,
+        color = "black",
+        margin = margin(b = 8)
+      ),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(
+        size = 10.5,
+        margin = margin(r = 7)
+      ),
+      axis.text.x = element_text(
+        size = 10,
+        color = "black"
+      ),
+      axis.text.y = element_text(
+        size = 9.5,
+        color = "black"
+      ),
+      axis.line = element_line(
+        linewidth = 0.45,
+        color = "black"
+      ),
+      axis.ticks = element_line(
+        linewidth = 0.4,
+        color = "black"
+      ),
+      axis.ticks.length = unit(2.2, "pt"),
+      legend.position = "none",
+      panel.grid = element_blank(),
+      plot.margin = margin(6, 8, 6, 6)
+    )
+}
+
+save_plot_all <- function(plot, filename_base, width, height, dpi = 600) {
+  ggsave(
+    filename = file.path(out_dir, paste0(filename_base, ".pdf")),
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in"
+  )
+
+  ggsave(
+    filename = file.path(out_dir, paste0(filename_base, ".png")),
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = dpi
+  )
+
+  if (requireNamespace("svglite", quietly = TRUE)) {
+    ggsave(
+      filename = file.path(out_dir, paste0(filename_base, ".svg")),
+      plot = plot,
+      width = width,
+      height = height,
+      units = "in",
+      device = svglite::svglite
+    )
+  }
+}
+
+analyze_threshold <- function(relab, units, thr, n_perm = 0) {
+  pa <- (relab >= thr) * 1L
+
+  keep_s <- rowSums(pa) > 0
+
+  if (any(!keep_s)) {
+    warning(sprintf(
+      "thr=%.4f: dropping %d empty sample(s)",
+      thr,
+      sum(!keep_s)
+    ))
+
+    pa <- pa[keep_s, , drop = FALSE]
+    units <- units[keep_s]
+  }
+
+  pa <- pa[, colSums(pa) > 0, drop = FALSE]
+
+  jac_sim <- 1 - as.matrix(vegdist(pa, method = "jaccard", binary = TRUE))
+
+  idx <- which(upper.tri(jac_sim), arr.ind = TRUE)
+
+  i <- idx[, 1]
+  j <- idx[, 2]
+  sim <- jac_sim[idx]
+
+  u1 <- units[i]
+  u2 <- units[j]
+
+  is_w <- u1 == u2
+
+  per_unit_within <- tapply(sim[is_w], u1[is_w], mean)
+
+  bw <- !is_w
+
+  pk <- ifelse(
+    u1[bw] < u2[bw],
+    paste(u1[bw], u2[bw], sep = "__"),
+    paste(u2[bw], u1[bw], sep = "__")
+  )
+
+  per_pair_between <- tapply(sim[bw], pk, mean)
+
+  w <- suppressWarnings(wilcox.test(
+    per_unit_within,
+    per_pair_between,
+    alternative = "greater"
+  ))
+
+  cl <- cliffs_delta(
+    as.numeric(per_unit_within),
+    as.numeric(per_pair_between)
+  )
+
+  stat_obs <- median(per_unit_within) - median(per_pair_between)
+
+  pu <- do.call(rbind, strsplit(names(per_pair_between), "__"))
+
+  excess <- sapply(names(per_unit_within), function(U) {
+    inv <- pu[, 1] == U | pu[, 2] == U
+    per_unit_within[U] - mean(per_pair_between[inv])
+  })
+
+  perm_p <- NA
+
+  if (n_perm > 0) {
+    ps <- numeric(n_perm)
+
+    for (p in seq_len(n_perm)) {
+      sp <- sample(units)
+
+      s1 <- sp[i]
+      s2 <- sp[j]
+
+      wp <- s1 == s2
+
+      wm <- tapply(sim[wp], s1[wp], mean)
+
+      k <- ifelse(
+        s1[!wp] < s2[!wp],
+        paste(s1[!wp], s2[!wp], sep = "__"),
+        paste(s2[!wp], s1[!wp], sep = "__")
+      )
+
+      bm <- tapply(sim[!wp], k, mean)
+
+      ps[p] <- median(wm) - median(bm)
+    }
+
+    perm_p <- (sum(ps >= stat_obs) + 1) / (n_perm + 1)
+  }
+
+  list(
+    threshold = thr,
+    per_unit_within = per_unit_within,
+    per_pair_between = per_pair_between,
+    excess = excess,
+    n_units = length(per_unit_within),
+    n_units_pos_excess = sum(excess > 0),
+    median_within = median(per_unit_within),
+    median_between = median(per_pair_between),
+    excess_overall = stat_obs,
+    wilcox_p = w$p.value,
+    cliffs_delta = cl,
+    perm_p = perm_p
+  )
+}
+```
+
+# 3. Load feature table and metadata
+
+```{r load-data}
+feat <- read_tsv_table(
+  asv_table_path,
+  features_as_rows = table_features_as_rows
+)
+
+meta <- read_metadata(metadata_path)
+
+dim(feat)
+head(meta)
+```
+
+# 4. Match sample IDs
+
+```{r match-samples}
+# Auto-detect sample-id column
+if (is.na(sample_id_col)) {
+  cand <- c(
+    "sample_id",
+    "sample-id",
+    "sampleid",
+    "SampleID",
+    "#SampleID",
+    "id",
+    "ID"
+  )
+
+  hit <- cand[cand %in% colnames(meta)]
+
+  if (!length(hit)) {
+    stop(paste0(
+      "Could not auto-detect the sample-id column. Set sample_id_col manually. Metadata columns: ",
+      paste(colnames(meta), collapse = ", ")
+    ))
+  }
+
+  sample_id_col <- hit[1]
+  message("Using sample-id column: ", sample_id_col)
+}
+
+if (!(unit_col %in% colnames(meta))) {
+  stop(paste0(
+    "unit_col '",
+    unit_col,
+    "' not found. Metadata columns: ",
+    paste(colnames(meta), collapse = ", ")
+  ))
+}
+
+meta <- data.frame(
+  sample_id = trimws(as.character(meta[[sample_id_col]])),
+  unit = trimws(as.character(meta[[unit_col]])),
+  stringsAsFactors = FALSE
+)
+
+colnames(feat) <- trimws(colnames(feat))
+
+common <- intersect(colnames(feat), meta$sample_id)
+
+if (!length(common)) {
+  stop("No overlapping sample IDs between feature table and metadata.")
+}
+
+cat(sprintf(
+  "Samples table = %d\nMetadata samples = %d\nOverlap = %d\n",
+  ncol(feat),
+  nrow(meta),
+  length(common)
+))
+
+feat <- feat[, common, drop = FALSE]
+meta <- meta[match(common, meta$sample_id), ]
+
+head(meta)
+```
+
+# 5. Filter small units and prepare count table
+
+```{r filter-units}
+un <- table(meta$unit)
+keep_u <- names(un)[un >= min_unit_n]
+
+cat(sprintf(
+  "Units before = %d\nUnits after min_unit_n >= %d = %d\n",
+  length(un),
+  min_unit_n,
+  length(keep_u)
+))
+
+sel <- meta$unit %in% keep_u
+
+feat <- feat[, sel, drop = FALSE]
+meta <- meta[sel, ]
+
+counts <- t(feat)
+counts <- counts[rowSums(counts) > 0, , drop = FALSE]
+
+meta <- meta[match(rownames(counts), meta$sample_id), ]
+
+table(meta$unit)
+```
+
+# 6. Rarefaction
+
+```{r rarefaction}
+depth <- rowSums(counts)
+
+cat(sprintf(
+  "Library size: min = %d, median = %d, max = %d\n",
+  min(depth),
+  as.integer(median(depth)),
+  max(depth)
+))
+
+if (do_rarefy) {
+  target <- if (is.na(min_depth)) {
+    min(depth)
+  } else {
+    as.integer(min_depth)
+  }
+
+  low <- depth < target
+
+  if (any(low)) {
+    cat(sprintf(
+      "Dropping %d sample(s) below depth %d\n",
+      sum(low),
+      target
+    ))
+
+    counts <- counts[!low, , drop = FALSE]
+    meta <- meta[match(rownames(counts), meta$sample_id), ]
+  }
+
+  counts <- rrarefy(counts, sample = target)
+
+  cat(sprintf("Rarefied to even depth = %d\n", target))
+}
+
+un <- table(meta$unit)
+keep_u <- names(un)[un >= min_unit_n]
+sel <- meta$unit %in% keep_u
+
+counts <- counts[sel, , drop = FALSE]
+meta <- meta[sel, ]
+
+cat(sprintf(
+  "FINAL: %d samples across %d units\n",
+  nrow(counts),
+  length(unique(meta$unit))
+))
+
+table(meta$unit)
+```
+
+# 7. Convert to relative abundance
+
+```{r relative-abundance}
+relab <- sweep(counts, 1, rowSums(counts), "/")
+units_vec <- meta$unit
+
+dim(relab)
+```
+
+# 8. Run primary analysis and threshold sensitivity
+
+```{r run-analysis}
+res <- analyze_threshold(
+  relab = relab,
+  units = units_vec,
+  thr = primary_thr,
+  n_perm = n_perm
+)
+
+scan <- lapply(thresholds, function(t) {
+  analyze_threshold(
+    relab = relab,
+    units = units_vec,
+    thr = t,
+    n_perm = 0
+  )
+})
+
+names(scan) <- sprintf("%.4f", thresholds)
+
+ep <- res$excess
+
+scan_cor <- sapply(scan, function(s) {
+  suppressWarnings(cor(
+    ep,
+    s$excess[names(ep)],
+    method = "spearman"
+  ))
+})
+
+scan_tab <- data.frame(
+  threshold = thresholds,
+  median_within = sapply(scan, function(s) s$median_within),
+  median_between = sapply(scan, function(s) s$median_between),
+  excess = sapply(scan, function(s) s$excess_overall),
+  wilcox_p = sapply(scan, function(s) s$wilcox_p),
+  cliffs_delta = sapply(scan, function(s) s$cliffs_delta),
+  n_units_pos_excess = sapply(scan, function(s) s$n_units_pos_excess),
+  n_units = sapply(scan, function(s) s$n_units),
+  spearman_excess_vs_primary = scan_cor,
+  row.names = NULL
+)
+
+scan_tab
+```
+
+# 9. Save result tables
+
+```{r save-tables}
+per_unit_within_excess <- data.frame(
+  unit = names(res$per_unit_within),
+  mean_within_jaccard = as.numeric(res$per_unit_within),
+  excess = res$excess[names(res$per_unit_within)]
+)
+
+per_unitpair_between <- data.frame(
+  unit_pair = names(res$per_pair_between),
+  mean_between_jaccard = as.numeric(res$per_pair_between)
+)
+
+write.csv(
+  per_unit_within_excess,
+  file.path(out_dir, "per_unit_within_excess.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  per_unitpair_between,
+  file.path(out_dir, "per_unitpair_between.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  scan_tab,
+  file.path(out_dir, "threshold_scan.csv"),
+  row.names = FALSE
+)
+
+per_unit_within_excess
+per_unitpair_between
+```
+
+# 10. Plot: within-gu vs between-gu sharing
+
+```{r plot-within-between, fig.width=4.2, fig.height=4.6}
+plot_df <- rbind(
+  data.frame(
+    group = "intra",
+    value = as.numeric(res$per_unit_within) * 100,
+    id = names(res$per_unit_within),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    group = "inter",
+    value = as.numeric(res$per_pair_between) * 100,
+    id = names(res$per_pair_between),
+    stringsAsFactors = FALSE
+  )
+)
+
+plot_df$group <- factor(
+  plot_df$group,
+  levels = c("inter", "intra")
+)
+
+# ---------------------------------------------------------
+# P-value label
+# 원본 분석은 within > between 단측 Wilcoxon이지만,
+# 네 예시 스타일은 two-sided Wilcoxon이므로 plotting용으로 별도 계산
+# ---------------------------------------------------------
+plot_p <- suppressWarnings(
+  wilcox.test(
+    value ~ group,
+    data = plot_df,
+    alternative = "two.sided"
+  )$p.value
+)
+
+p_label <- paste0("P = ", formatC(plot_p, format = "e", digits = 2))
+
+# ---------------------------------------------------------
+# Bracket 위치 자동 계산
+# ---------------------------------------------------------
+y_max <- max(plot_df$value, na.rm = TRUE)
+y_min <- min(plot_df$value, na.rm = TRUE)
+y_rng <- y_max - y_min
+
+bracket_y <- y_max + y_rng * 0.10
+text_y    <- bracket_y + y_rng * 0.025
+
+y_upper <- text_y + y_rng * 0.06
+
+# ---------------------------------------------------------
+# Figure
+# ---------------------------------------------------------
+p_within_between <- ggplot(
+  plot_df,
+  aes(x = group, y = value, fill = group)
+) +
+  geom_violin(
+    width = 0.82,
+    trim = FALSE,
+    scale = "width",
+    color = "black",
+    linewidth = 0.65,
+    alpha = 0.82
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    fill = "white",
+    alpha = 0.70,
+    linewidth = 0.65
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "crossbar",
+    width = 0.15,
+    linewidth = 0.75,
+    color = "black"
+  ) +
+  annotate(
+    "segment",
+    x = 1,
+    xend = 2,
+    y = bracket_y,
+    yend = bracket_y,
+    linewidth = 0.65,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = text_y,
+    label = p_label,
+    size = 3.0,
+    color = "black"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "inter" = "#D9D9D9",
+      "intra" = "#F29A9A"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(NA, y_upper),
+    expand = expansion(mult = c(0.03, 0.02))
+  ) +
+  labs(
+    title = "Overall mean ASV sharing rate",
+    subtitle = "Statistics: two-sided Wilcoxon rank-sum test; P shown",
+    x = NULL,
+    y = "Mean ASV Sharing rate (%)"
+  ) +
+  theme_minimal(base_size = 11, base_family = "sans") +
+  theme(
+    plot.title = element_text(
+      size = 14,
+      face = "bold",
+      color = "black",
+      hjust = 0
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      color = "black",
+      hjust = 0,
+      margin = margin(b = 8)
+    ),
+    axis.title.y = element_text(
+      size = 10.5,
+      face = "bold",
+      color = "black",
+      margin = margin(r = 8)
+    ),
+    axis.text.x = element_text(
+      size = 9.5,
+      color = "grey35"
+    ),
+    axis.text.y = element_text(
+      size = 9.5,
+      color = "grey35"
+    ),
+    panel.grid.major.x = element_line(
+      linewidth = 0.45,
+      color = "grey90"
+    ),
+    panel.grid.major.y = element_line(
+      linewidth = 0.45,
+      color = "grey88"
+    ),
+    panel.grid.minor.y = element_line(
+      linewidth = 0.30,
+      color = "grey92"
+    ),
+    panel.grid.minor.x = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(8, 10, 8, 8)
+  )
+
+p_within_between
+```
+
+# 11. Save figure
+
+```{r save-figure}
+ggsave(
+  filename = file.path(out_dir, "within_vs_between.pdf"),
+  plot = p_within_between,
+  width = fig_width,
+  height = fig_height,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(out_dir, "within_vs_between.png"),
+  plot = p_within_between,
+  width = fig_width,
+  height = fig_height,
+  units = "in",
+  dpi = fig_dpi
+)
+
+if (requireNamespace("svglite", quietly = TRUE)) {
+  ggsave(
+    filename = file.path(out_dir, "within_vs_between.svg"),
+    plot = p_within_between,
+    width = fig_width,
+    height = fig_height,
+    units = "in",
+    device = svglite::svglite
+  )
+}
+```
+
+# 12. Primary result summary
+
+```{r summary}
+cat("\n================ PRIMARY RESULT ================\n")
+cat(sprintf("Threshold                     : %.4f\n", primary_thr))
+cat(sprintf("Units                         : %d\n", res$n_units))
+cat(sprintf("Median within-gu Jaccard      : %.4f\n", res$median_within))
+cat(sprintf("Median between-gu Jaccard     : %.4f\n", res$median_between))
+cat(sprintf("Excess, within - between      : %.4f\n", res$excess_overall))
+cat(sprintf("Wilcoxon, within > between P  : %.3g\n", res$wilcox_p))
+cat(sprintf("Cliff's delta                 : %.3f\n", res$cliffs_delta))
+
+if (!is.na(res$perm_p)) {
+  cat(sprintf("Permutation P                 : %.3g\n", res$perm_p))
+}
+
+cat(sprintf(
+  "Units with positive excess    : %d / %d\n",
+  res$n_units_pos_excess,
+  res$n_units
+))
+
+cat("\nThreshold sensitivity:\n")
+print(scan_tab, row.names = FALSE)
+
+cat("\nInterpretation note:\n")
+cat("This is a negative-control urban contrast. A small or non-significant within-gu excess is expected.\n")
+cat("Compare excess and Cliff's delta to the rural village result, not the absolute Jaccard value.\n")
+```

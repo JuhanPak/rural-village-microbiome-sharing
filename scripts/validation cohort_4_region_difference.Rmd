@@ -1,0 +1,676 @@
+---
+title: 4_region_difference
+author: "Juhan Pak"
+date: "2026-06-28"
+output: html_document
+---
+
+---
+title: "Regional comparison"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# =====================================================================
+# Regional comparison (fast):
+# alpha + PCoA(first) + PERMANOVA(199) + betadisper
+#
+# R Markdown version
+# - Original script style retained
+# - Reads exported QIIME2 feature-table.tsv directly
+# - Alpha diversity plot changed to violin plot
+# - Saves PDF and SVG figures
+#
+# CAVEAT:
+# 3 distant regions => differences are expected and CONFOUNDED, not sharing.
+# =====================================================================
+
+required_pkgs <- c("vegan", "svglite")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressMessages(library(vegan))
+```
+
+# 1. User parameters
+
+```{r parameters}
+## ------------------------- USER PARAMETERS ---------------------------
+asv_table_path <- "inputs/exported_clustering_table/feature-table.tsv"
+metadata_path  <- "inputs/clustering_meta.txt"
+
+sample_id_col  <- NA
+region_col     <- "category"
+
+table_features_as_rows <- TRUE
+
+do_rarefy      <- TRUE
+min_depth      <- NA
+
+detect_thr     <- 0.001
+
+permutations   <- 199
+pcoa_max_n     <- 2000
+
+seed           <- 1
+out_dir        <- "results"
+## --------------------------------------------------------------------
+
+set.seed(seed)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+tic <- function(msg) {
+  cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), msg))
+}
+```
+
+# 2. Helper functions
+
+```{r helper-functions}
+read_tsv_table <- function(path, far = TRUE) {
+  if (!file.exists(path)) {
+    stop("Feature table not found: ", path)
+  }
+
+  first <- readLines(path, n = 1)
+
+  skip <- if (grepl("^# Constructed", first)) 1L else 0L
+
+  df <- read.table(
+    path,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    skip = skip,
+    row.names = 1,
+    stringsAsFactors = FALSE
+  )
+
+  m <- as.matrix(df)
+  storage.mode(m) <- "numeric"
+
+  if (!far) {
+    m <- t(m)
+  }
+
+  m
+}
+
+read_metadata <- function(path) {
+  if (!file.exists(path)) {
+    stop("Metadata file not found: ", path)
+  }
+
+  lines <- readLines(path)
+
+  lines <- lines[!grepl("^#q2:types", lines)]
+
+  con <- textConnection(lines)
+  on.exit(close(con))
+
+  read.table(
+    con,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("NA")
+  }
+
+  if (p < 0.001) {
+    return("<0.001")
+  }
+
+  sprintf("%.3g", p)
+}
+
+violin_at <- function(v, xc, width, col) {
+  v <- v[is.finite(v)]
+
+  if (length(v) < 5) {
+    return(invisible())
+  }
+
+  d <- density(v)
+  w <- d$y / max(d$y) * width
+
+  polygon(
+    c(xc - w, rev(xc + w)),
+    c(d$x, rev(d$x)),
+    col = col,
+    border = "grey30",
+    lwd = 0.7
+  )
+
+  qs <- quantile(v, c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+  rect(
+    xc - 0.045,
+    qs[1],
+    xc + 0.045,
+    qs[3],
+    col = "white",
+    border = "grey30",
+    lwd = 0.7
+  )
+
+  segments(
+    xc - 0.065,
+    qs[2],
+    xc + 0.065,
+    qs[2],
+    lwd = 1.3
+  )
+}
+```
+
+# 3. Load table and metadata
+
+```{r load-data}
+tic("loading table + metadata")
+
+feat <- read_tsv_table(
+  asv_table_path,
+  far = table_features_as_rows
+)
+
+meta <- read_metadata(metadata_path)
+
+dim(feat)
+head(meta)
+```
+
+# 4. Match sample IDs
+
+```{r match-samples}
+if (is.na(sample_id_col)) {
+  cand <- c(
+    "sample_id",
+    "sample-id",
+    "sampleid",
+    "SampleID",
+    "#SampleID",
+    "id",
+    "ID",
+    "#OTU ID",
+    "featureid"
+  )
+
+  hit <- cand[cand %in% colnames(meta)]
+
+  if (!length(hit)) {
+    stop(paste(
+      "set sample_id_col. cols:",
+      paste(colnames(meta), collapse = ", ")
+    ))
+  }
+
+  sample_id_col <- hit[1]
+
+  message("Using sample-id column: ", sample_id_col)
+}
+
+if (!(region_col %in% colnames(meta))) {
+  stop(paste(
+    "region_col not found. cols:",
+    paste(colnames(meta), collapse = ", ")
+  ))
+}
+
+meta <- data.frame(
+  sample_id = trimws(as.character(meta[[sample_id_col]])),
+  region = trimws(as.character(meta[[region_col]])),
+  stringsAsFactors = FALSE
+)
+
+colnames(feat) <- trimws(colnames(feat))
+
+common <- intersect(colnames(feat), meta$sample_id)
+
+if (!length(common)) {
+  stop("no overlapping sample ids")
+}
+
+cat(sprintf(
+  "Samples table=%d metadata=%d overlap=%d\n",
+  ncol(feat),
+  nrow(meta),
+  length(common)
+))
+
+feat <- feat[, common, drop = FALSE]
+meta <- meta[match(common, meta$sample_id), ]
+
+counts <- t(feat)
+counts <- counts[rowSums(counts) > 0, , drop = FALSE]
+
+meta <- meta[match(rownames(counts), meta$sample_id), ]
+
+dim(counts)
+head(meta)
+```
+
+# 5. Rarefaction
+
+```{r rarefaction}
+if (do_rarefy) {
+  depth <- rowSums(counts)
+
+  target <- if (is.na(min_depth)) {
+    min(depth)
+  } else {
+    as.integer(min_depth)
+  }
+
+  low <- depth < target
+
+  if (any(low)) {
+    counts <- counts[!low, , drop = FALSE]
+    meta <- meta[match(rownames(counts), meta$sample_id), ]
+  }
+
+  counts <- rrarefy(counts, sample = target)
+
+  tic(sprintf("rarefied to %d", target))
+}
+
+region <- factor(meta$region)
+
+cat("Samples per region:\n")
+print(table(region))
+
+relab <- sweep(counts, 1, rowSums(counts), "/")
+pa <- (relab >= detect_thr) * 1L
+
+pa <- pa[, colSums(pa) > 0, drop = FALSE]
+```
+
+# 6. Alpha diversity
+
+```{r alpha-diversity}
+tic("alpha diversity")
+
+shannon <- diversity(counts, index = "shannon")
+
+kw <- kruskal.test(shannon ~ region)
+
+pw <- suppressWarnings(
+  pairwise.wilcox.test(
+    shannon,
+    region,
+    p.adjust.method = "BH"
+  )
+)
+
+alpha_df <- data.frame(
+  sample_id = rownames(counts),
+  region = as.character(region),
+  shannon = shannon,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  alpha_df,
+  file.path(out_dir, "region_alpha.csv"),
+  row.names = FALSE
+)
+
+kw
+pw$p.value
+```
+
+# 7. Alpha diversity violin plot
+
+```{r alpha-violin-plot, fig.width=5, fig.height=5}
+region_levels <- levels(region)
+
+alpha_cols <- setNames(
+  c("#cfe8f3", "#f4a6a6", "#c7e9c0", "#d9d2e9", "#fdd0a2", "#b2dfdb")[seq_along(region_levels)],
+  region_levels
+)
+
+alpha_ymax <- max(shannon, na.rm = TRUE)
+alpha_ymin <- min(shannon, na.rm = TRUE)
+alpha_rng <- alpha_ymax - alpha_ymin
+
+draw_alpha_violin <- function() {
+  par(mar = c(4, 4, 4, 1))
+
+  plot(
+    NA,
+    xlim = c(0.5, length(region_levels) + 0.5),
+    ylim = c(alpha_ymin - alpha_rng * 0.05, alpha_ymax + alpha_rng * 0.18),
+    xaxt = "n",
+    xlab = "",
+    ylab = "Shannon diversity",
+    main = sprintf("Alpha (KW p=%s)", format_p(kw$p.value))
+  )
+
+  axis(
+    1,
+    at = seq_along(region_levels),
+    labels = region_levels
+  )
+
+  for (k in seq_along(region_levels)) {
+    v <- shannon[region == region_levels[k]]
+
+    violin_at(
+      v = v,
+      xc = k,
+      width = 0.30,
+      col = alpha_cols[region_levels[k]]
+    )
+  }
+
+  box()
+}
+
+# PDF 저장
+pdf(
+  file.path(out_dir, "region_alpha.pdf"),
+  width = 5,
+  height = 5
+)
+draw_alpha_violin()
+dev.off()
+
+# SVG 저장
+svglite::svglite(
+  file.path(out_dir, "region_alpha.svg"),
+  width = 5,
+  height = 5
+)
+draw_alpha_violin()
+dev.off()
+
+# R Markdown 화면 출력
+draw_alpha_violin()
+```
+
+# 8. Distances and PCoA
+
+```{r distances-pcoa}
+tic("computing distances")
+
+d_bray <- vegdist(counts, method = "bray")
+d_jac <- vegdist(pa, method = "jaccard", binary = TRUE)
+
+plot_pcoa <- function(d, region, label, fname_base) {
+  dm <- as.matrix(d)
+  n <- nrow(dm)
+
+  if (!is.na(pcoa_max_n) && n > pcoa_max_n) {
+    idx <- sort(sample(seq_len(n), pcoa_max_n))
+    dm <- dm[idx, idx]
+    rg <- droplevels(region[idx])
+  } else {
+    rg <- region
+  }
+
+  cm <- cmdscale(as.dist(dm), k = 2, eig = TRUE)
+
+  ev <- cm$eig
+  pv <- 100 * ev / sum(ev[ev > 0])
+
+  cols <- setNames(
+    c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")[seq_along(levels(rg))],
+    levels(rg)
+  )
+
+  draw_pcoa <- function() {
+    plot(
+      cm$points,
+      col = cols[as.character(rg)],
+      pch = 19,
+      cex = 0.5,
+      xlab = sprintf("PCo1 (%.1f%%)", pv[1]),
+      ylab = sprintf("PCo2 (%.1f%%)", pv[2]),
+      main = label
+    )
+
+    legend(
+      "topright",
+      legend = levels(rg),
+      col = cols,
+      pch = 19,
+      bty = "n"
+    )
+  }
+
+  # PDF 저장
+  pdf(
+    paste0(fname_base, ".pdf"),
+    width = 5.5,
+    height = 5
+  )
+  draw_pcoa()
+  dev.off()
+
+  # SVG 저장
+  svglite::svglite(
+    paste0(fname_base, ".svg"),
+    width = 5.5,
+    height = 5
+  )
+  draw_pcoa()
+  dev.off()
+
+  # R Markdown 화면 출력
+  draw_pcoa()
+}
+
+tic("PCoA Bray")
+
+plot_pcoa(
+  d_bray,
+  region,
+  "PCoA Bray-Curtis",
+  file.path(out_dir, "region_pcoa_bray")
+)
+
+tic("PCoA Jaccard")
+
+plot_pcoa(
+  d_jac,
+  region,
+  "PCoA Jaccard",
+  file.path(out_dir, "region_pcoa_jaccard")
+)
+
+tic("PCoA done -> figures ready")
+```
+
+# 9. PERMANOVA and betadisper
+
+```{r permanova-betadisper}
+run_pn <- function(d, label) {
+  tic(paste("PERMANOVA", label))
+
+  a <- adonis2(d ~ region, permutations = permutations)
+
+  bd <- betadisper(d, region)
+  pt <- permutest(bd, permutations = permutations)
+
+  list(
+    R2 = a$R2[1],
+    F = a$F[1],
+    p = a$`Pr(>F)`[1],
+    disp_p = pt$tab$`Pr(>F)`[1]
+  )
+}
+
+res_bray <- run_pn(d_bray, "Bray-Curtis")
+res_jac <- run_pn(d_jac, "Jaccard")
+
+res_bray
+res_jac
+```
+
+# 10. Pairwise PERMANOVA
+
+```{r pairwise-permanova}
+pw_pn <- function(d) {
+  lev <- levels(region)
+  cmb <- combn(lev, 2)
+  dm <- as.matrix(d)
+
+  out <- data.frame()
+
+  for (k in seq_len(ncol(cmb))) {
+    gpair <- cmb[, k]
+    sel <- region %in% gpair
+
+    a <- adonis2(
+      as.dist(dm[sel, sel]) ~ droplevels(region[sel]),
+      permutations = permutations
+    )
+
+    out <- rbind(
+      out,
+      data.frame(
+        pair = paste(gpair, collapse = " vs "),
+        R2 = a$R2[1],
+        F = a$F[1],
+        p = a$`Pr(>F)`[1]
+      )
+    )
+  }
+
+  out$p_adj <- p.adjust(out$p, "BH")
+
+  out
+}
+
+tic("pairwise PERMANOVA")
+
+pwb <- pw_pn(d_bray)
+pwj <- pw_pn(d_jac)
+
+pwb
+pwj
+```
+
+# 11. Save statistics
+
+```{r save-statistics}
+region_permanova <- rbind(
+  data.frame(
+    metric = "Bray",
+    test = "global",
+    group = "all",
+    R2 = res_bray$R2,
+    F = res_bray$F,
+    p = res_bray$p,
+    p_adj = NA
+  ),
+  data.frame(
+    metric = "Jaccard",
+    test = "global",
+    group = "all",
+    R2 = res_jac$R2,
+    F = res_jac$F,
+    p = res_jac$p,
+    p_adj = NA
+  ),
+  data.frame(
+    metric = "Bray",
+    test = "pairwise",
+    group = pwb$pair,
+    R2 = pwb$R2,
+    F = pwb$F,
+    p = pwb$p,
+    p_adj = pwb$p_adj
+  ),
+  data.frame(
+    metric = "Jaccard",
+    test = "pairwise",
+    group = pwj$pair,
+    R2 = pwj$R2,
+    F = pwj$F,
+    p = pwj$p,
+    p_adj = pwj$p_adj
+  )
+)
+
+region_dispersion <- data.frame(
+  metric = c("Bray", "Jaccard"),
+  betadisper_p = c(res_bray$disp_p, res_jac$disp_p)
+)
+
+write.csv(
+  region_permanova,
+  file.path(out_dir, "region_permanova.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  region_dispersion,
+  file.path(out_dir, "region_dispersion.csv"),
+  row.names = FALSE
+)
+
+region_permanova
+region_dispersion
+```
+
+# 12. Final summary
+
+```{r final-summary}
+cat("\n==================== REGIONAL COMPARISON ====================\n")
+
+print(table(region))
+
+cat(sprintf("\nAlpha Shannon KW p = %.3g\n", kw$p.value))
+
+cat(sprintf(
+  "PERMANOVA Bray    : R2=%.4f F=%.2f p=%.3g  (betadisper p=%.3g)\n",
+  res_bray$R2,
+  res_bray$F,
+  res_bray$p,
+  res_bray$disp_p
+))
+
+cat(sprintf(
+  "PERMANOVA Jaccard : R2=%.4f F=%.2f p=%.3g  (betadisper p=%.3g)\n",
+  res_jac$R2,
+  res_jac$F,
+  res_jac$p,
+  res_jac$disp_p
+))
+
+cat("\nPairwise PERMANOVA (Bray):\n")
+print(pwb, row.names = FALSE)
+
+cat("\nWritten:\n")
+cat(" - results/region_alpha.csv\n")
+cat(" - results/region_alpha.pdf\n")
+cat(" - results/region_alpha.svg\n")
+cat(" - results/region_pcoa_bray.pdf\n")
+cat(" - results/region_pcoa_bray.svg\n")
+cat(" - results/region_pcoa_jaccard.pdf\n")
+cat(" - results/region_pcoa_jaccard.svg\n")
+cat(" - results/region_permanova.csv\n")
+cat(" - results/region_dispersion.csv\n")
+
+cat("\nReminder: 3 distant regions => differences expected & confounded, not sharing.\n")
+
+tic("ALL DONE")
+```

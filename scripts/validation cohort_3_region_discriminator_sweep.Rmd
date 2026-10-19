@@ -1,0 +1,586 @@
+---
+title: "Untitled"
+author: "Juhan Pak"
+date: "2026-06-28"
+output: html_document
+---
+
+---
+title: "Region-discriminator removal sweep"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# =====================================================================
+# Region-discriminator removal check
+#
+# R Markdown version
+# - Original style retained
+# - Reads exported QIIME2 feature-table.tsv directly
+# - No qiime2R required
+# - No biom command required
+# - Saves both PDF and SVG
+#
+# Ranks ASVs by how strongly their prevalence differs ACROSS the three
+# regions, then strips the top-k discriminators and tracks whether each
+# region's intra-inter Jaccard excess collapses toward 0.
+#
+#   concentrated structure -> excess drops after removing few markers
+#   diffuse structure       -> excess decays slowly
+#
+# NOTE:
+# This characterizes regional structure.
+# It does NOT prove contact-driven sharing.
+# =====================================================================
+
+required_pkgs <- c("vegan", "svglite")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressMessages(library(vegan))
+```
+
+# 1. User parameters
+
+```{r parameters}
+## ------------------------- USER PARAMETERS ---------------------------
+asv_table_path <- "inputs/exported_clustering_table/feature-table.tsv"
+metadata_path  <- "inputs/clustering_meta.txt"
+taxonomy_path  <- "inputs/taxonomy.tsv"  # best-effort taxonomy annotation
+
+sample_id_col  <- NA
+region_col     <- "category"
+
+table_features_as_rows <- TRUE
+
+do_rarefy      <- TRUE
+min_depth      <- NA
+
+detect_thr     <- 0.001
+
+max_per_region <- 300
+
+k_grid         <- c(0, 10, 25, 50, 100, 200, 400)
+
+n_perm         <- 150
+
+seed           <- 1
+out_dir        <- "results"
+## --------------------------------------------------------------------
+
+set.seed(seed)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 2. Helper functions
+
+```{r helper-functions}
+read_tsv_table <- function(path, far = TRUE) {
+  if (!file.exists(path)) {
+    stop("Feature table not found: ", path)
+  }
+
+  first <- readLines(path, n = 1)
+
+  skip <- if (grepl("^# Constructed", first)) {
+    1L
+  } else {
+    0L
+  }
+
+  df <- read.table(
+    path,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    skip = skip,
+    row.names = 1,
+    stringsAsFactors = FALSE
+  )
+
+  m <- as.matrix(df)
+  storage.mode(m) <- "numeric"
+
+  if (!far) {
+    m <- t(m)
+  }
+
+  m
+}
+
+read_metadata <- function(path) {
+  if (!file.exists(path)) {
+    stop("Metadata file not found: ", path)
+  }
+
+  lines <- readLines(path)
+
+  lines <- lines[!grepl("^#q2:types", lines)]
+
+  con <- textConnection(lines)
+  on.exit(close(con))
+
+  read.table(
+    con,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+pair_excess <- function(M, rv, k) {
+  inR <- which(rv == k)
+  outR <- which(rv != k)
+
+  sub <- M[inR, inR, drop = FALSE]
+
+  intra <- sub[upper.tri(sub)]
+  inter <- c(M[inR, outR])
+
+  c(
+    med_intra = median(intra),
+    med_inter = median(inter),
+    excess = median(intra) - median(inter)
+  )
+}
+```
+
+# 3. Load table and metadata
+
+```{r load-data}
+## ---- load + align ----
+
+feat <- read_tsv_table(
+  asv_table_path,
+  far = table_features_as_rows
+)
+
+meta <- read_metadata(metadata_path)
+
+dim(feat)
+head(meta)
+```
+
+# 4. Match sample IDs
+
+```{r match-samples}
+if (is.na(sample_id_col)) {
+  cand <- c(
+    "sample_id",
+    "sample-id",
+    "sampleid",
+    "SampleID",
+    "#SampleID",
+    "id",
+    "ID"
+  )
+
+  hit <- cand[cand %in% colnames(meta)]
+
+  if (!length(hit)) {
+    stop(paste(
+      "set sample_id_col. cols:",
+      paste(colnames(meta), collapse = ", ")
+    ))
+  }
+
+  sample_id_col <- hit[1]
+
+  message("Using sample-id column: ", sample_id_col)
+}
+
+if (!(region_col %in% colnames(meta))) {
+  stop(paste(
+    "region_col not found. cols:",
+    paste(colnames(meta), collapse = ", ")
+  ))
+}
+
+meta <- data.frame(
+  sample_id = trimws(as.character(meta[[sample_id_col]])),
+  region = trimws(as.character(meta[[region_col]])),
+  stringsAsFactors = FALSE
+)
+
+colnames(feat) <- trimws(colnames(feat))
+
+common <- intersect(colnames(feat), meta$sample_id)
+
+if (!length(common)) {
+  stop("no overlapping sample ids")
+}
+
+cat(sprintf(
+  "Samples table=%d metadata=%d overlap=%d\n",
+  ncol(feat),
+  nrow(meta),
+  length(common)
+))
+
+feat <- feat[, common, drop = FALSE]
+meta <- meta[match(common, meta$sample_id), ]
+
+counts <- t(feat)
+counts <- counts[rowSums(counts) > 0, , drop = FALSE]
+
+meta <- meta[match(rownames(counts), meta$sample_id), ]
+
+dim(counts)
+head(meta)
+```
+
+# 5. Subsample per region
+
+```{r subsample-per-region}
+set.seed(seed)
+
+keep <- unlist(
+  lapply(split(seq_len(nrow(counts)), meta$region), function(ix) {
+    if (length(ix) > max_per_region) {
+      sample(ix, max_per_region)
+    } else {
+      ix
+    }
+  })
+)
+
+counts <- counts[keep, , drop = FALSE]
+meta <- meta[keep, ]
+
+reg <- factor(meta$region)
+
+cat("Samples per region:\n")
+print(table(reg))
+```
+
+# 6. Rarefaction and presence/absence
+
+```{r rarefy-presence-absence}
+if (do_rarefy) {
+  depth <- rowSums(counts)
+
+  target <- if (is.na(min_depth)) {
+    min(depth)
+  } else {
+    as.integer(min_depth)
+  }
+
+  low <- depth < target
+
+  if (any(low)) {
+    counts <- counts[!low, , drop = FALSE]
+    reg <- droplevels(reg[!low])
+  }
+
+  counts <- rrarefy(counts, sample = target)
+
+  cat(sprintf("rarefied to %d\n", target))
+}
+
+relab <- sweep(counts, 1, rowSums(counts), "/")
+
+pa <- (relab >= detect_thr) * 1L
+pa <- pa[, colSums(pa) > 0, drop = FALSE]
+
+levs <- levels(reg)
+regv <- as.integer(reg)
+
+cat("Final samples per region:\n")
+print(table(reg))
+
+dim(pa)
+```
+
+# 7. Region discrimination score per ASV
+
+```{r region-discrimination}
+## ---- region discrimination per ASV ----
+# Prevalence variance across regions
+
+prevM <- sapply(seq_along(levs), function(k) {
+  colMeans(pa[regv == k, , drop = FALSE])
+})
+
+# Ensure matrix has ASV rows and region columns
+rownames(prevM) <- colnames(pa)
+colnames(prevM) <- levs
+
+disc <- apply(prevM, 1, var)
+
+ord <- order(disc, decreasing = TRUE)
+
+head(data.frame(
+  ASV = names(disc)[ord[1:min(10, length(ord))]],
+  disc_var = disc[ord[1:min(10, length(ord))]]
+))
+```
+
+# 8. Permutation helper
+
+```{r permutation-helper}
+perm_p_region <- function(M, rv) {
+  mdiff <- function(rr) {
+    sapply(seq_along(levs), function(k) {
+      inR <- which(rr == k)
+      outR <- which(rr != k)
+
+      if (length(inR) < 3) {
+        return(NA)
+      }
+
+      sub <- M[inR, inR, drop = FALSE]
+
+      mean(sub[upper.tri(sub)]) - mean(M[inR, outR])
+    })
+  }
+
+  obs <- mdiff(rv)
+
+  null <- matrix(NA, n_perm, length(levs))
+
+  for (p in seq_len(n_perm)) {
+    null[p, ] <- mdiff(sample(rv))
+  }
+
+  sapply(seq_along(levs), function(k) {
+    (1 + sum(null[, k] >= obs[k], na.rm = TRUE)) /
+      (sum(!is.na(null[, k])) + 1)
+  })
+}
+```
+
+# 9. Sweep over top-k discriminators removed
+
+```{r discriminator-sweep}
+## ---- sweep over k removed ----
+
+res <- data.frame()
+
+for (k in k_grid) {
+  drop_idx <- if (k > 0) {
+    ord[seq_len(min(k, length(ord)))]
+  } else {
+    integer(0)
+  }
+
+  pa_k <- if (length(drop_idx)) {
+    pa[, -drop_idx, drop = FALSE]
+  } else {
+    pa
+  }
+
+  good <- rowSums(pa_k) > 0
+  rv <- regv[good]
+
+  M <- 1 - as.matrix(
+    vegdist(
+      pa_k[good, , drop = FALSE],
+      method = "jaccard",
+      binary = TRUE
+    )
+  )
+
+  ex <- t(
+    sapply(seq_along(levs), function(r) {
+      pair_excess(M, rv, r)
+    })
+  )
+
+  pp <- perm_p_region(M, rv)
+
+  res <- rbind(
+    res,
+    data.frame(
+      k_removed = k,
+      region = levs,
+      n_asv = ncol(pa_k),
+      med_intra = ex[, "med_intra"],
+      med_inter = ex[, "med_inter"],
+      excess = ex[, "excess"],
+      perm_p = pp
+    )
+  )
+}
+
+write.csv(
+  res,
+  file.path(out_dir, "region_discriminator_sweep.csv"),
+  row.names = FALSE
+)
+
+res
+```
+
+# 10. Plot excess vs top-k ASVs removed
+
+```{r plot-sweep, fig.width=7, fig.height=5}
+## ---- plot excess vs k removed ----
+
+cols <- c("#377eb8", "#4daf4a", "#e41a1c")
+
+yr <- range(res$excess, na.rm = TRUE)
+
+draw_discriminator_sweep_plot <- function() {
+  par(mar = c(4.5, 4.5, 3, 1))
+
+  plot(
+    NA,
+    xlim = range(k_grid),
+    ylim = yr,
+    xlab = "# top region-discriminating ASVs removed",
+    ylab = "intra - inter excess (median Jaccard)",
+    main = "Does regional excess collapse when markers removed?"
+  )
+
+  abline(
+    h = 0,
+    col = "grey60",
+    lty = 2
+  )
+
+  for (i in seq_along(levs)) {
+    d <- res[res$region == levs[i], ]
+
+    lines(
+      d$k_removed,
+      d$excess,
+      col = cols[(i - 1) %% 3 + 1],
+      lwd = 2,
+      type = "b",
+      pch = 19
+    )
+  }
+
+  legend(
+    "topright",
+    legend = levs,
+    col = cols[((seq_along(levs) - 1) %% 3) + 1],
+    lwd = 2,
+    pch = 19,
+    bty = "n",
+    cex = 0.9
+  )
+}
+
+# PDF 저장
+pdf(
+  file.path(out_dir, "region_discriminator_sweep.pdf"),
+  width = 7,
+  height = 5
+)
+draw_discriminator_sweep_plot()
+dev.off()
+
+# SVG 저장
+svglite::svglite(
+  file.path(out_dir, "region_discriminator_sweep.svg"),
+  width = 7,
+  height = 5
+)
+draw_discriminator_sweep_plot()
+dev.off()
+
+# R Markdown 화면 출력
+draw_discriminator_sweep_plot()
+```
+
+# 11. Top discriminators and taxonomy annotation
+
+```{r top-discriminators}
+## ---- top discriminators + best-effort taxonomy ----
+
+top <- head(ord, 50)
+
+disc_tbl <- data.frame(
+  ASV = colnames(pa)[top],
+  disc_var = disc[top],
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(levs)) {
+  disc_tbl[[paste0("prev_", levs[i])]] <- round(prevM[top, i], 3)
+}
+
+tax_join <- 0
+
+if (file.exists(taxonomy_path)) {
+  tx <- tryCatch(
+    read.table(
+      taxonomy_path,
+      header = TRUE,
+      sep = "\t",
+      quote = "",
+      comment.char = "",
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(tx)) {
+    colnames(tx)[1:2] <- c("ASV", "Taxon")
+
+    disc_tbl$Taxon <- tx$Taxon[match(disc_tbl$ASV, tx$ASV)]
+
+    tax_join <- mean(!is.na(disc_tbl$Taxon))
+  }
+}
+
+write.csv(
+  disc_tbl,
+  file.path(out_dir, "region_top_discriminators.csv"),
+  row.names = FALSE
+)
+
+head(disc_tbl, 20)
+```
+
+# 12. Final report
+
+```{r final-report}
+## ---- report ----
+
+cat("\n===== EXCESS vs MARKERS REMOVED =====\n")
+
+for (r in levs) {
+  d <- res[res$region == r, ]
+
+  cat(sprintf(
+    "  %-13s excess: k=0 %+.4f (perm %.3f)  ->  k=%d %+.4f (perm %.3f)\n",
+    r,
+    d$excess[1],
+    d$perm_p[1],
+    max(k_grid),
+    d$excess[nrow(d)],
+    d$perm_p[nrow(d)]
+  ))
+}
+
+cat(sprintf(
+  "\nTop-50 region discriminators -> region_top_discriminators.csv (taxonomy join: %.0f%%)\n",
+  100 * tax_join
+))
+
+if (tax_join < 0.5) {
+  cat("  (low join: clustering_table ASV ids differ from taxonomy file; ids reported instead)\n")
+}
+
+cat("Full sweep -> region_discriminator_sweep.csv | plot -> region_discriminator_sweep.pdf/.svg\n")
+
+cat("\nRead:\n")
+cat(" if Jungang excess falls to ~0 after removing few markers -> concentrated indicator taxa;\n")
+cat(" if it persists across the grid -> diffuse community-wide regional difference.\n")
+```
